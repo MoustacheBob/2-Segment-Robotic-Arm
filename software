@@ -1,0 +1,440 @@
+"""
+Robotic Arm Coordinate Input GUI
+----------------------------------
+A PyQt5 application that lets the user enter the lengths of a two-segment
+robotic arm (L1, L2) and a target point (x, y, z), sends those values to
+an Arduino over a serial connection, and receives back the base rotation
+angle and the two arm joint angles (the Arduino does the inverse-kinematics
+math). The app shows connection/status messages and draws a 3D
+visualization of the resulting arm pose using matplotlib.
+
+Serial protocol (edit to match your Arduino sketch):
+    PC  -> Arduino:  "L1,L2,X,Y,Z\\n"      (5 comma separated floats)
+    Arduino -> PC :  "BASE,ANGLE1,ANGLE2\\n" (3 comma separated floats, degrees)
+"""
+import os
+import sys
+import math
+import time
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
+    QLineEdit, QPushButton, QLabel, QFrame, QSizePolicy, QComboBox
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont,QIcon,QImage,QPixmap
+
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3D projection)
+
+import serial
+
+
+# ----------------------------------------------------------------------
+# Styling
+# ----------------------------------------------------------------------
+
+BOX_BG =  "#4EAAAAAA"
+BOX_BORDER = "#1A1919"
+FIELD_BG = "#272727"
+FIELD_TEXT = "#ffffff"
+OUTPUT_BG = "#272727"
+GREEN = "#27ae60"
+GREEN_HOVER = "#2ecc71"
+BG_IMAGE = "RoboticArm/bg.png"
+
+
+STYLESHEET = f"""
+QWidget#mainWindow {{
+    border-image: url({BG_IMAGE}) 0 0 0 0 stretch stretch;
+}}
+
+QFrame#box {{
+    background-color: {BOX_BG};
+    border: 2px solid {BOX_BORDER};
+    border-radius: 22px;
+    
+}}
+
+QLineEdit {{
+    background-color: {FIELD_BG};
+    color: {FIELD_TEXT};
+    border: none;
+    border-radius: 10px;
+    padding: 8px;
+    font-size: 13px;
+}}
+
+QLineEdit:focus {{
+    border: 2px solid #ffffff;
+}}
+
+QLineEdit[readOnly="true"] {{
+    background-color: {OUTPUT_BG};
+    color: {FIELD_TEXT};
+}}
+
+QLabel {{
+    color: #cfcfcf;
+    font-size: 11px;
+}}
+
+QLabel#statusLabel {{
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: bold;
+}}
+
+QPushButton#submitBtn {{
+    background-color: {GREEN};
+    border-radius: 14px;
+    color: white;
+    font-size: 16px;
+    font-weight: bold;
+}}
+
+QPushButton#submitBtn:hover {{
+    background-color: {GREEN_HOVER};
+}}
+"""
+
+
+def labeled_field(text, placeholder, readonly=False):
+    """Create a small vertical container: label on top, QLineEdit below."""
+    container = QVBoxLayout()
+    container.setSpacing(2)
+    lbl = QLabel(text)
+    lbl.setAlignment(Qt.AlignCenter)
+    edit = QLineEdit()
+    edit.setPlaceholderText(placeholder)
+    edit.setAlignment(Qt.AlignCenter)
+    edit.setReadOnly(readonly)
+    if readonly:
+        edit.setProperty("readOnly", True)
+    container.addWidget(lbl)
+    container.addWidget(edit)
+    return container, edit
+
+
+class RobotArmWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("mainWindow")
+        self.setWindowTitle("Robotic Arm Coordinate Input")
+        self.resize(440, 820)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(STYLESHEET)
+        self.serial_conn = None
+        self._build_ui()
+        self.setWindowIcon(QIcon(r"RoboticArm\ico.png"))
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
+
+        # ---------------- Serial connection row --------------------------
+        serial_row = QHBoxLayout()
+        serial_row.setSpacing(8)
+
+        self.port_edit = QLineEdit()
+        self.port_edit.setPlaceholderText("/dev/ttyUSB0 or COM3")
+        self.port_edit.setText("COM3")
+
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.baud_combo.setCurrentText("9600")
+
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setCursor(Qt.PointingHandCursor)
+        self.connect_btn.clicked.connect(self.connect_serial)
+
+        self.conn_status_label = QLabel("\u25cf disconnected")
+        self.conn_status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+
+        serial_row.addWidget(QLabel("Port:"))
+        serial_row.addWidget(self.port_edit, 2)
+        serial_row.addWidget(QLabel("Baud:"))
+        serial_row.addWidget(self.baud_combo, 1)
+        serial_row.addWidget(self.connect_btn)
+        serial_row.addWidget(self.conn_status_label)
+
+        main_layout.addLayout(serial_row)
+
+        # ---------------- Box 1: inputs (L1, L2, Submit / x, y, z) -----
+        box1 = QFrame()
+        box1.setObjectName("box")
+        box1_layout = QGridLayout(box1)
+        box1_layout.setContentsMargins(20, 18, 20, 18)
+        box1_layout.setHorizontalSpacing(14)
+        box1_layout.setVerticalSpacing(12)
+
+        l1_box, self.l1_edit = labeled_field("L1 (length)", "e.g. 10")
+        l2_box, self.l2_edit = labeled_field("L2 (length)", "e.g. 10")
+
+        submit_col = QVBoxLayout()
+        submit_col.setSpacing(2)
+        submit_lbl = QLabel("Submit")
+        submit_lbl.setAlignment(Qt.AlignCenter)
+        self.submit_btn = QPushButton("\u2713")  # checkmark
+        self.submit_btn.setObjectName("submitBtn")
+        self.submit_btn.setFixedHeight(34)
+        self.submit_btn.setCursor(Qt.PointingHandCursor)
+        self.submit_btn.clicked.connect(self.send_to_arduino)
+        submit_col.addWidget(submit_lbl)
+        submit_col.addWidget(self.submit_btn)
+
+        x_box, self.x_edit = labeled_field("X", "x coord")
+        y_box, self.y_edit = labeled_field("Y", "y coord")
+        z_box, self.z_edit = labeled_field("Z", "z coord")
+
+        box1_layout.addLayout(l1_box, 0, 0)
+        box1_layout.addLayout(l2_box, 0, 1)
+        box1_layout.addLayout(submit_col, 0, 2)
+        box1_layout.addLayout(x_box, 1, 0)
+        box1_layout.addLayout(y_box, 1, 1)
+        box1_layout.addLayout(z_box, 1, 2)
+
+        # ---------------- Box 2: outputs (base, angle1, angle2) -------
+        box2 = QFrame()
+        box2.setObjectName("box")
+        box2_layout = QGridLayout(box2)
+        box2_layout.setContentsMargins(20, 18, 20, 18)
+        box2_layout.setHorizontalSpacing(14)
+
+        base_box, self.base_out = labeled_field("Base angle", "--", readonly=True)
+        a1_box, self.angle1_out = labeled_field("Arm 1 angle", "--", readonly=True)
+        a2_box, self.angle2_out = labeled_field("Arm 2 angle", "--", readonly=True)
+
+        box2_layout.addLayout(base_box, 0, 0)
+        box2_layout.addLayout(a1_box, 0, 1)
+        box2_layout.addLayout(a2_box, 0, 2)
+
+        # ---------------- Status row ------------------------------------
+        self.status_label = QLabel("Status: waiting for input...")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+
+        # ---------------- Matplotlib visualization (white square) -------
+        self.figure = Figure(figsize=(4, 4))
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setMinimumHeight(300)
+        self.ax = self.figure.add_subplot(111, projection="3d")
+        self._draw_arm(None)  # initial empty plot
+
+        # ---------------- Assemble ---------------------------------------
+        main_layout.addWidget(box1)
+        main_layout.addWidget(box2)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.canvas)
+
+    # ------------------------------------------------------------------
+    # Serial connection handling
+    # ------------------------------------------------------------------
+    def connect_serial(self):
+        """Open (or re-open) the serial connection using the port/baud fields."""
+        port = self.port_edit.text().strip()
+        baud = int(self.baud_combo.currentText())
+
+        if not port:
+            self._set_error("Error: please enter a serial port (e.g. COM3 or /dev/ttyUSB0).")
+            return False
+
+        # Close any existing connection first.
+        if self.serial_conn is not None and self.serial_conn.is_open:
+            self.serial_conn.close()
+
+        try:
+            self.serial_conn = serial.Serial(port, baud, timeout=2)
+            time.sleep(2)  # give the Arduino time to reset after the port opens
+        except serial.SerialException as exc:
+            self.serial_conn = None
+            self.conn_status_label.setText("\u25cf disconnected")
+            self.conn_status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self._set_error(f"Error: could not open serial port '{port}': {exc}")
+            return False
+
+        self.conn_status_label.setText(f"\u25cf connected ({port}@{baud})")
+        self.conn_status_label.setStyleSheet("color: #2ecc71; font-size: 11px;")
+        self.status_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.status_label.setText(f"Status: connected to {port} at {baud} baud.")
+        return True
+
+    def _ensure_connected(self):
+        if self.serial_conn is not None and self.serial_conn.is_open:
+            return True
+        return self.connect_serial()
+
+    # ------------------------------------------------------------------
+    # Send target to Arduino, receive computed angles back
+    # ------------------------------------------------------------------
+    def send_to_arduino(self):
+        # ---- parse inputs -------------------------------------------------
+        try:
+            l1 = float(self.l1_edit.text())
+            l2 = float(self.l2_edit.text())
+            x = float(self.x_edit.text())
+            y = float(self.y_edit.text())
+            z = float(self.z_edit.text())
+        except ValueError:
+            self._set_error("Error: please enter valid numeric values in all fields.")
+            return
+
+        if l1 <= 0 or l2 <= 0:
+            self._set_error("Error: segment lengths L1 and L2 must be positive.")
+            return
+
+        if not self._ensure_connected():
+            return  # error already shown by _ensure_connected / connect_serial
+
+        # ---- send to Arduino ----------------------------------------------
+        message = f"{l1:.4f},{l2:.4f},{x:.4f},{y:.4f},{z:.4f}\n"
+        try:
+            self.serial_conn.reset_input_buffer()
+            self.serial_conn.write(message.encode("utf-8"))
+            self.serial_conn.flush()
+        except serial.SerialException as exc:
+            self._set_error(f"Error: failed to send data to Arduino: {exc}")
+            return
+
+        # ---- wait for response ---------------------------------------------
+        self.status_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.status_label.setText("Status: sent target, waiting for Arduino response...")
+
+        try:
+            raw_line = self.serial_conn.readline()  # blocks up to the configured timeout
+        except serial.SerialException as exc:
+            self._set_error(f"Error: lost connection while reading from Arduino: {exc}")
+            return
+
+        if not raw_line:
+            self._set_error("Error: no response from Arduino (timed out). Check wiring/baud rate.")
+            return
+
+        # ---- parse response ----------------------------------------------
+        try:
+            text = raw_line.decode("utf-8", errors="ignore").strip()
+            parts = [p.strip() for p in text.split(",")]
+            if len(parts) != 3:
+                raise ValueError(f"expected 3 values, got {len(parts)}: '{text}'")
+            base_angle, angle1, angle2 = (float(p) for p in parts)
+        except ValueError as exc:
+            self._set_error(f"Error: invalid data received from Arduino ({exc}).")
+            return
+
+        # ---- update outputs --------------------------------------------
+        self.base_out.setText(f"{base_angle:.2f}\u00b0")
+        self.angle1_out.setText(f"{angle1:.2f}\u00b0")
+        self.angle2_out.setText(f"{angle2:.2f}\u00b0")
+
+        self.status_label.setStyleSheet("color: #2ecc71; font-size: 13px; font-weight: bold;")
+        self.status_label.setText(
+            f"Status: OK \u2014 angles received from Arduino (base={base_angle:.1f}\u00b0, "
+            f"arm1={angle1:.1f}\u00b0, arm2={angle2:.1f}\u00b0)."
+        )
+
+        self._draw_arm((l1, l2, base_angle, angle1, angle2, x, y, z))
+
+    def _set_error(self, message):
+        self.base_out.setText("--")
+        self.angle1_out.setText("--")
+        self.angle2_out.setText("--")
+        self.status_label.setStyleSheet("color: #e74c3c; font-size: 13px; font-weight: bold;")
+        self.status_label.setText(message)
+        self._draw_arm(None)
+
+    # ------------------------------------------------------------------
+    # Visualization
+    # ------------------------------------------------------------------
+    def _draw_arm(self, solution):
+        """Draw a 3D view of the arm given (l1, l2, base_angle, angle1, angle2, x, y, z).
+
+        Angle convention (adjust to match your Arduino firmware if different):
+          base_angle : rotation of the whole arm about the vertical Z axis, degrees.
+          angle1     : angle of segment 1 (upper arm) measured from horizontal, degrees.
+          angle2     : angle of segment 2 (forearm) relative to segment 1, degrees
+                       (0 = continues straight on from segment 1).
+        """
+        self.ax.clear()
+
+        if solution is None:
+            self.ax.set_xlim(-1, 1)
+            self.ax.set_ylim(-1, 1)
+            self.ax.set_zlim(-1, 1)
+            self.ax.text(0, 0, 0, "No data", ha="center", va="center", color="gray")
+            self.ax.set_xticks([])
+            self.ax.set_yticks([])
+            self.ax.set_zticks([])
+            self.canvas.draw()
+            return
+
+        l1, l2, base_angle, angle1, angle2, x, y, z = solution
+
+        base_rad = math.radians(360+base_angle)
+        a1 = math.radians(angle1)
+        a2 = math.radians(angle1 + angle2) # absolute angle of segment 2 in its vertical plane
+
+        shoulder = (0.0, 0.0, 0.0)
+
+        elbow = (
+            l1 * math.cos(a1) * math.cos(base_rad),
+            l1 * math.cos(a1) * math.sin(base_rad),
+            l1 * math.sin(a1),
+        )
+
+        end = (
+            elbow[0] + l2 * math.cos(a2) * math.cos(base_rad),
+            elbow[1] + l2 * math.cos(a2) * math.sin(base_rad),
+            elbow[2] + l2 * math.sin(a2),
+        )
+
+        xs = [shoulder[0], elbow[0], end[0]]
+        ys = [shoulder[1], elbow[1], end[1]]
+        zs = [shoulder[2], elbow[2], end[2]]
+
+        # arm segments
+        self.ax.plot(xs, ys, zs, "-o", color="#2c3e50", linewidth=4, markersize=7,
+                     markerfacecolor="#27ae60", markeredgecolor="black")
+        # base marker
+        self.ax.scatter([shoulder[0]], [shoulder[1]], [shoulder[2]],
+                        color="#304357", s=60, label="base")
+        # requested target (as entered by the user)
+        self.ax.scatter([x], [y], [z], color="red", marker="x", s=70, linewidths=3, label="target")
+
+        reach = l1 + l2
+        margin = reach * 0.15 + 0.1
+        lim = reach + margin
+        self.ax.set_xlim(-lim, lim)
+        self.ax.set_ylim(-lim, lim)
+        self.ax.set_zlim(-lim, lim)
+        self.ax.set_box_aspect((1, 1, 1))
+        self.ax.set_xlabel("X", fontsize=8)
+        self.ax.set_ylabel("Y", fontsize=8)
+        self.ax.set_zlabel("Z", fontsize=8)
+        self.ax.set_title("Arm 3D visualization", fontsize=9)
+        self.ax.view_init(elev=22, azim=45)
+        self.ax.legend(loc="upper right", fontsize=8)
+
+        self.canvas.draw()
+
+    def closeEvent(self, event):
+        if self.serial_conn is not None and self.serial_conn.is_open:
+            self.serial_conn.close()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = RobotArmWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+   
