@@ -8,7 +8,7 @@
 
 This is a simple, mostly 3D printed 2 Segment Robotic Arm. Coordinates are inputed via the desktop programm, made using PyQt5, Serial for communicating with the arm and matplotlib to visualize the arms position. The coordinates are sent to the arms Arduino UNO R3 as a string, parsed and used to calculated the motors angles. The Servos use the ServoEasing library to allow for smooth movement, the Nema17 Stepper motor is controlled using a Custom Wrapper of the popular AccelStepper library and a Bigtreetech TMC2209 Motor Driver.
 
-Setting up the software side is (as much as I feel like it) explained in this Github Repo, the arm itself along with the models are on Printables here : **PLACEHOLDER**
+Setting up the software side is (as much as I feel like it) explained in this Github Repo, the arm itself along with the models are on Printables here : https://www.printables.com/model/1837281-simple-2-segment-robotic-arm
 
 
 *note: Im unfamiliar with sharing software like this, you will need to install the required libraries manually, ill try to remember to name them, or just look through the code to find them.*
